@@ -1,0 +1,2342 @@
+---
+title: "Fishery monitoring on the Saba Bank statistics"
+author: "Amina Schellekens"
+date: "24-04-2025"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+
+This report presents an overview of fishery monitoring on the Saba Bank, using data collected from March 2024 to April 2025. Key fisheries indicators, including Catch Per Unit Effort (CPUE), Landings Per Unit Effort (LPUE), and Fishing Pressure, are calculated and analyzed. Additionally, the contribution of each Saban fishing vessel is examined to provide insights into their involvement in the fishery.
+
+
+```{r setup, include=FALSE}
+# Install only if missing
+packages <- c("dplyr", "googlesheets4", "ggplot2", "janitor", "writexl", "pander", "AER")
+new_packages <- packages[!(packages %in% installed.packages()[,"Package"])]
+if(length(new_packages)) install.packages(new_packages)
+
+# Load libraries
+library(dplyr)
+library(googlesheets4)
+library(ggplot2)
+library(gridExtra)
+library(tidyr)
+library(stringr)
+library(janitor)
+library(writexl)
+library(scales)
+library(pander)
+library(MASS)
+library(AER)
+
+```
+
+```{r, include=FALSE}
+#CONNECTING TO GOOGLE SHEETS -----------------------------------------------------------------------------------
+
+#Authenticate and specify Google Sheet
+gs4_auth(email = "amina.schellekens@gmail.com")
+sheet_url <- "https://docs.google.com/spreadsheets/d/1bPAdnLJkTQPMfCIoFykc_SKyXqrFadk1S81zEupE2OE/edit?gid=1378040648#gid=1378040648"
+
+#Get data from the correct sheet
+data <- read_sheet(sheet_url, sheet = 5)
+
+data$Depth_m_max <- as.numeric(data$Depth_m_max)
+data$Depth_m_min <- as.numeric(data$Depth_m_min)
+
+data <- data %>%
+  mutate(Species_cn = tolower(Species_cn))
+
+#DATA PREPERATION ----------------------------------------------------------------------------------------------
+
+#1. CHECK AND REMOVE NA'S
+#Convert empty rows to NA in trap_no and Species_cn and remove those: This will be used for LPUE & CPUE
+cleaned_data <- data %>%
+  filter(!is.na(Trap_no), !is.na(Species_cn))
+
+
+#2. CHECK NUMBER OF FISHING GEARS USED PER DATE
+gear_per_day_check <- cleaned_data %>%
+  group_by(`Date (DD/MM/YYYY)`) %>%  #Group by date
+  summarise(gear_count = n_distinct(Fishing_gear)) %>%  #Count distinct fishing gear types per day
+  filter(gear_count > 1)  # Filter for dates where more than one gear type was used
+
+#View the result
+gear_per_day_check #3 dates have multiple gear types used per day so this needs to be accounted for
+
+#Handle multiple gear types with resetting trap count whenever a new gear type is used
+expanded_data <- cleaned_data %>%
+  group_by(`Date (DD/MM/YYYY)`, Fishing_gear) %>%  
+  arrange(`Date (DD/MM/YYYY)`, Fishing_gear, Trap_no) %>% 
+  mutate(
+    Trap_no = as.integer(Trap_no)  
+  ) %>%
+  ungroup()
+
+#3 INCLUDE EMPTY TRAPS TO FISHING EFFORT
+#Get the maximum trap number per date and gear type
+#This is the effort per date per gear type (so number of traps used)
+trap_range_per_date_and_gear <- expanded_data %>%
+  group_by(`Date (DD/MM/YYYY)`, Fishing_gear) %>%  #Group by both date and gear type
+  summarise(
+    max_trap = max(Trap_no, na.rm = TRUE)  #Calculate the max trap number for each group
+  )
+
+#Generate a complete sequence of traps starting from 1 for each date and fishing gear (if multiple are used per date)
+#Generate a complete sequence of traps starting from 1 for each date and fishing gear (if multiple are used per date)
+all_traps <- trap_range_per_date_and_gear %>%
+  rowwise() %>%
+  mutate(all_trap_numbers = list(seq(1, max_trap))) %>%
+  unnest(cols = all_trap_numbers) %>%
+  rename(Trap_no = all_trap_numbers) %>%
+  ungroup() 
+
+all_traps <- all_traps[, c("Date (DD/MM/YYYY)", "Fishing_gear", "Trap_no")]
+
+#Merge with the original data to include missing traps (correct fishing gear is already assigned to empty traps)
+#"Whole" status added to all empty traps (because all empty traps are whole counts)
+expanded_data_with_empty_traps <- all_traps %>%
+  left_join(expanded_data, by = c("Date (DD/MM/YYYY)", "Fishing_gear", "Trap_no")) %>%
+  mutate(`Partial/Whole` = ifelse(is.na(`Partial/Whole`), "Whole", `Partial/Whole`))
+
+```
+
+# Cacth per unit effort
+
+```{r, include = FALSE}
+#
+
+# FOR ONBOARD SAMPLING DATA
+#1. PREPARE DATA FOR CPUE & LPUE CALCULATION (only 'whole' trap counts) --> using not 'whole' trap counts will overestimate the effort
+#Check how many entries have partial counts
+num_partial <- expanded_data_with_empty_traps %>%
+  filter(`Partial/Whole` != "Whole") %>%
+  nrow()
+
+print(num_partial) #n=419
+
+#Filter for 'whole' counts only
+expanded_data_whole <- expanded_data_with_empty_traps %>%
+  filter(`Partial/Whole` == "Whole")
+
+
+#2.CALCULATE CATCH
+#Calculate total number of individuals caught per species
+catch_per_species <- expanded_data_whole %>%
+  group_by(Species_cn, Fishing_gear) %>% 
+  summarise(
+    total_catch = n(),  
+    .groups = 'drop'
+  )
+
+#3. CALCULATE EFFORT
+#Filter trap range for only "Whole" observations
+trap_range_per_date_and_gear_whole <- expanded_data %>%
+  filter(`Partial/Whole` == "Whole") %>%  #Keep only whole observations
+  group_by(`Date (DD/MM/YYYY)`, Fishing_gear) %>%  #Group by date and gear type
+  summarise(
+    max_trap = max(Trap_no, na.rm = TRUE),  # Calculate max trap number per group
+    .groups = 'drop'
+  )
+
+#Calculate total effort per gear type
+total_effort_per_gear <- trap_range_per_date_and_gear_whole %>%
+  group_by(Fishing_gear) %>%
+  summarise(
+    total_effort = sum(max_trap, na.rm = TRUE),  #Sum the max traps per gear type
+    .groups = 'drop'  
+  )
+
+#Total number of catches per species per gear type
+catch_per_species <- cleaned_data %>%
+  group_by(Species_cn, Fishing_gear) %>%  
+  summarise(
+    total_catch = n(),  
+    .groups = 'drop'
+  )
+
+cpue_data <- catch_per_species %>%
+  left_join(total_effort_per_gear, by = "Fishing_gear") %>%
+  mutate(
+    CPUE = total_catch / total_effort  # Calculate CPUE: total catch divided by total effort per gear type
+  )
+```
+
+
+
+## Catch per unit effort based on onboard monitoring data
+
+This table shows the CPUE based on onboard monitoring data for all species caught. CPUE values are calculated per gear type if the species was caught with more than one gear type.
+
+```{r, echo=FALSE}
+pander(data.frame(Species = cpue_data$Species_cn, Gear = cpue_data$Fishing_gear, CPUE = cpue_data$CPUE))
+```
+
+
+```{r, include=FALSE}
+#CPUE table snappers
+snapper_cpue_data <- cpue_data %>%
+  filter(Species_cn %in% c("yelloweye snapper", "vermillion snapper", "blackfin snapper", "lane snapper"),
+         Fishing_gear == "RP")
+
+#CPUE table mixed fish
+mixedfish_cpue_data <- cpue_data %>%
+  filter(Species_cn %in% c("red hind", "queen triggerfish", "white grunt", "cotton wick", "blue tang", "ocean surgeonfish"),
+         Fishing_gear == "LP")
+
+#CPUE table lobsters
+#Extract total effort for LP gear
+effort_LP <- total_effort_per_gear %>%
+  filter(Fishing_gear == "LP") %>%
+  pull(total_effort)  
+
+#No males, females, berried, shorts
+lobster_catches <- expanded_data_whole %>%
+  filter(Fishing_gear == "LP") %>%
+  summarise(
+    berried = sum(Berried == "Y", na.rm = TRUE),
+    shorts = sum(Length < 9.5, na.rm = TRUE),
+    males = sum(Sex == "M", na.rm = TRUE),
+    females = sum(Sex == "F", na.rm = TRUE)
+  )
+
+#CPUE males, females, berried, shorts
+lobster_cpue <- lobster_catches %>%
+  mutate(
+    CPUE_berried = berried / effort_LP,
+    CPUE_shorts = shorts / effort_LP,
+    CPUE_males = males / effort_LP,
+    CPUE_females = females / effort_LP
+  ) %>%
+  transmute(  # Using transmute to create a new data frame with only CPUE values
+    CPUE_berried = CPUE_berried,
+    CPUE_shorts = CPUE_shorts,
+    CPUE_males = CPUE_males,
+    CPUE_females = CPUE_females
+  )
+
+```
+
+### Redfish cpue
+```{r, echo=FALSE}
+pander(snapper_cpue_data)
+```
+
+### Mixed fish cpue
+```{r, echo=FALSE}
+pander(mixedfish_cpue_data)
+```
+
+### Lobster cpue
+```{r, echo=FALSE}
+pander(lobster_cpue)
+```
+
+```{r, include=FALSE}
+#TOTAL
+#Calculate total catch per date and gear
+total_catch_per_date_and_gear <- expanded_data %>%
+  filter(`Partial/Whole` == "Whole") %>%  #Keep only "Whole" counts
+  group_by(`Date (DD/MM/YYYY)`, Fishing_gear) %>%
+  summarise(
+    total_catch = n(),  #Count the remaining rows indicating actual catches
+    .groups = 'drop'
+  )
+
+
+#trap_range_per_date_and_gear gives the effort per date and gear
+#calculate CPUE per date and gear over time
+cpue_over_time <- total_catch_per_date_and_gear %>%
+  left_join(trap_range_per_date_and_gear, by = c("Date (DD/MM/YYYY)", "Fishing_gear")) %>%
+  mutate(
+    cpue = total_catch / max_trap  #Calculate CPUE: total catch divided by effort
+  )
+
+#Plot total CPUE over time
+cpue_tot_plot <- ggplot(cpue_over_time, aes(x = `Date (DD/MM/YYYY)`, y = cpue)) +
+  geom_line() +  
+  geom_point() +  
+  labs(
+    title = "Total CPUE Over Time 2024-2025",
+    x = "Date",
+    y = "CPUE (Catch per Unit Effort)"
+  ) +
+  theme_minimal() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+```
+
+
+```{r, include = FALSE}
+#PER SPECIES
+#Calculate total catch per date and gear for one species of interest
+species_catch_per_date_and_gear <- expanded_data %>%
+  filter(Species_cn == "Acanthostracion polygonia", `Partial/Whole` == "Whole") %>%  #Filter for species of interest and whole counts
+  group_by(`Date (DD/MM/YYYY)`, Fishing_gear) %>% 
+  summarise(
+    total_catch = n(),   #Count the rows corresponding to the catches of this species
+    .groups = 'drop'
+  )
+
+
+#trap_range_per_date_and_gear gives the effort per date and gear
+#calculate CPUE per date and gear over time
+species_cpue_over_time <- species_catch_per_date_and_gear %>%
+  left_join(trap_range_per_date_and_gear, by = c("Date (DD/MM/YYYY)", "Fishing_gear")) %>%
+  mutate(
+    cpue = total_catch / max_trap  # Calculate CPUE: total catch divided by total effort
+  )
+
+#Plot the CPUE over time for the species showing different gear types
+ggplot(species_cpue_over_time, aes(x = `Date (DD/MM/YYYY)`, y = cpue, color = Fishing_gear)) +   
+  geom_line() +  # Line plot with different colors for each gear type
+  geom_point() +  # Add points for each data point
+  labs(
+    title = "CPUE Over Time for Selected Species by Gear Type",
+    x = "Date",
+    y = "CPUE (Catch Per Unit Effort)"
+  ) + 
+  theme_minimal() +  # Clean theme
+  scale_color_brewer(palette = "Set1")  # Optional: Use a color palette for gear types
+
+
+#IN A LOOP FOR THE TOP 10 SPECIES (IN CATCH NUMBERS)
+#Select the top 10 species based on total catch, only considering "Whole" counts & excluding NAs
+top_species <- expanded_data %>%
+  filter(`Partial/Whole` == "Whole", !is.na(Species_cn)) %>%  # Keep only "Whole" counts & exclude NAs
+  count(Species_cn, name = "total_catch") %>%  # Count occurrences per species
+  arrange(desc(total_catch)) %>%  # Sort by total catch
+  slice_head(n = 10)  # Select top 10 species
+
+# List of species from the top_species data frame
+species_list <- top_species$Species_cn  
+
+
+#Create an empty list to store the plots
+all_species_cpue_plots <- list()
+
+```
+
+## CPUE over for 10 species that have the highest catch
+
+These graphs show CPUE values over time for the top ten most caught species. If species were caught using multiple gear types CPUE values were calculated per gear type.
+
+
+
+```{r, echo=FALSE}
+#Loop through each species to create the CPUE plots
+for (species in species_list) {
+  
+  #Filter data for the specific species
+  species_catch_per_date_and_gear <- expanded_data %>%
+    filter(Species_cn == species) %>%  #Filter for the species in the loop
+    group_by(`Date (DD/MM/YYYY)`, Fishing_gear) %>%  
+    summarise(
+      total_catch = n(),  #Count the rows corresponding to the catches of this species
+      .groups = 'drop'
+    )
+  
+  #Calculate CPUE per date and gear over time
+  species_cpue_over_time <- species_catch_per_date_and_gear %>%
+    left_join(trap_range_per_date_and_gear, by = c("Date (DD/MM/YYYY)", "Fishing_gear")) %>%
+    mutate(
+      cpue = total_catch / max_trap  #Calculate CPUE: total catch divided by total effort
+    )
+  
+  #Create the plot for the species and store it in the list
+  cpue_species_plot <- ggplot(species_cpue_over_time, aes(x = `Date (DD/MM/YYYY)`, y = cpue, color = Fishing_gear)) +   
+    geom_line() +  
+    geom_point() + 
+    labs(
+      title = paste(species),
+      x = "Date",
+      y = "CPUE"
+    ) + 
+    theme_minimal() +  
+    scale_color_manual(
+      values = c(
+        "LP" = "dodgerblue",  # Lobster gear is blue
+        "RP" = "red3",   # Redfish gear is red
+        "LP/MP" = "limegreen"  # Combined LP/MP is green
+      )) 
+  
+      print(cpue_species_plot) 
+      
+  #Add the plot to the list
+  all_species_cpue_plots[[species]] <- cpue_species_plot
+}
+
+```
+
+```{r, include=FALSE}
+grid.arrange(grobs = all_species_cpue_plots, ncol = 2) 
+```
+
+# Total catch per unit effort over time
+
+```{r, include=FALSE}
+cpue_tot_plot
+```
+
+
+```{r, include=FALSE}
+
+#CPUE over time for species of interest
+ggplot(species_cpue_over_time, aes(x = `Date (DD/MM/YYYY)`, y = cpue, color = Fishing_gear)) +   
+  geom_line() +  # Line plot with different colors for each gear type
+  geom_point() +  # Add points for each data point
+  labs(
+    title = "CPUE Over Time for Selected Species by Gear Type",
+    x = "Date",
+    y = "CPUE (Catch Per Unit Effort)"
+  ) + 
+  theme_minimal() +  
+  scale_color_brewer(palette = "Set1")  
+```
+
+
+
+
+# Landings per unit effort (LPUE)
+
+## Using onboard/port sampling data
+
+This table shows the LPUE based on onboard monitoring data for all species caught. LPUE values are calculated per gear type if the species was caught with more than one gear type.
+
+```{r, include=FALSE}
+
+#1. USING ONBOARD/PORT SAMPLING DATA
+
+#Calculate total number of individuals landed
+#Filter for landed individuals and only "Whole" observations
+landed_data <- cleaned_data %>%
+  filter(`Landed/Discarded` == "Landed", `Partial/Whole` == "Whole")  
+
+#Total number of landings per species (1 landing means 1 individual was landed)
+total_landings_per_species <- landed_data %>%
+  group_by(Species_cn, Fishing_gear) %>%
+  summarise(
+    total_landings = n()  
+  )
+
+#Effort <- total_effort_per_gear
+
+#Calculate LPUE per species
+lpue_data <- total_landings_per_species %>%
+  left_join(total_effort_per_gear, by = c("Fishing_gear")) %>%
+  mutate(LPUE = total_landings / total_effort)  # Calculate LPUE: landings divided by effort
+
+#LPUE table snappers
+snapper_lpue_data <- lpue_data %>%
+  filter(Species_cn %in% c("yelloweye snapper", "vermillion snapper", "blackfin snapper", "lane snapper"),
+         Fishing_gear == "RP")
+
+#LPUE table mixed fish
+mixedfish_lpue_data <- lpue_data %>%
+  filter(Species_cn %in% c("red hind", "queen triggerfish", "white grunt", "cotton wick", "blue tang", "ocean surgeonfish"),
+         Fishing_gear == "LP")
+
+#LPUE tables lobsters
+#Check if any berried or short individuals were landed
+berried_individuals <- landed_data %>%
+  filter(Fishing_gear == "LP", Berried == "Y")
+
+short_individuals <- landed_data %>%
+  filter(Fishing_gear == "LP", Species_cn == "caribbean spiny lobster", Length < 9.5 )
+
+#No males, females, berried, shorts
+lobster_landings <- landed_data %>%
+  filter(Fishing_gear == "LP") %>%
+  summarise(
+    berried = sum(Berried == "Y", na.rm = TRUE),
+    shorts = sum(Length < 9.5, na.rm = TRUE),
+    males = sum(Sex == "M", na.rm = TRUE),
+    females = sum(Sex == "F", na.rm = TRUE)
+  )
+
+#LPUE males, females, berried, shorts
+  lobster_lpue <- lobster_landings %>%
+  mutate(
+    LPUE_berried = berried / effort_LP,
+    LPUE_shorts = shorts / effort_LP,
+    LPUE_males = males / effort_LP,
+    LPUE_females = females / effort_LP
+  ) %>%
+  transmute(  # Using transmute to create a new data frame with only CPUE values
+    LPUE_berried = LPUE_berried,
+    LPUE_shorts = LPUE_shorts,
+    LPUE_males = LPUE_males,
+    LPUE_females = LPUE_females
+  )
+```
+
+```{r, echo=FALSE}
+pander(data.frame(Species = lpue_data$Species_cn, Gear = lpue_data$Fishing_gear, CPUE = lpue_data$LPUE))
+```
+
+### Redfish lpue
+```{r, echo=FALSE}
+pander(snapper_lpue_data)
+```
+
+### Mixed fish lpue
+```{r, echo=FALSE}
+pander(mixedfish_lpue_data)
+```
+
+### Lobster lpue
+```{r, echo=FALSE}
+pander(lobster_lpue)
+```
+
+## Using short interview data
+
+```{r, include=FALSE}
+
+#2. USING SHORT INTERVIEW DATA - FOR LOBSTERS ONLY
+#For lobster we know the exact number of landed individuals
+
+#Get a list of all trip_id's associated with onboard sampling
+onboard_trip_ids <- data %>%
+  filter(`Gridboard/Onboard` == "ONBOARD") %>%
+  distinct(Trip_ID) %>%  # Keep only unique Trip_IDs
+  pull(Trip_ID)  # Extract as a vector
+
+print(onboard_trip_ids)          # ----> These need to be deleted from the short interview data
+length(onboard_trip_ids)
+
+#Import short interview data
+lob_SI <- read_sheet(sheet_url, sheet = "ShortInterview", col_names = FALSE)  
+lob_SI <- lob_SI %>% 
+  row_to_names(row_number = 2) 
+
+#Fix 'date' column
+lob_SI <- lob_SI[!sapply(lob_SI$`Date (d/m/y)`, is.null), ]
+lob_SI$`Date (d/m/y)` <- unlist(lob_SI$`Date (d/m/y)`)
+lob_SI$`Date (d/m/y)` <- as.POSIXct(lob_SI$`Date (d/m/y)`, origin = "1970-01-01", tz = "UTC")
+
+#Subset for useful variables
+lob_SI.vars <- c("Date (d/m/y)","Month",
+                 "Boat_name", "Fishing_gear", "Trip_ID",
+                 "Fishing_area","Depth_m_min","Depth_m_max",
+                 "Soaking_time_days","Traps_no", "Traps_lost_no",
+                 "Lobster_no","Lobster_berried_no","Lobster_undersized_no")
+
+lob_SI  <- lob_SI[,lob_SI.vars]
+
+#Fix structure 
+cols_to_fix <- c("Depth_m_min", "Depth_m_max", 
+                 "Soaking_time_days", "Traps_no", "Traps_lost_no",
+                 "Lobster_no", "Lobster_berried_no", "Lobster_undersized_no")
+
+lob_SI <- lob_SI %>%
+  mutate(across(all_of(cols_to_fix), ~ as.numeric(sapply(., function(x) ifelse(is.null(x), NA, x)))))
+
+
+#Removing trip_id's corresponding to onboard monitoring (goal is to compare onboard and short interview data)
+matching_rows <- lob_SI %>%
+  filter(Trip_ID %in% onboard_trip_ids) %>%
+  nrow()
+
+print(paste("Number of matching rows:", matching_rows)) #check how many rows will be removed
+
+lob_SI <- lob_SI %>%
+  filter(!Trip_ID %in% onboard_trip_ids) #remove the rows 
+
+
+#Calculate the number of landed lobsters per gear type
+lob_SI_landed <- lob_SI %>%
+  group_by(Fishing_gear) %>%
+  summarise(Landed = sum(Lobster_no, na.rm = TRUE))
+
+#Calculate the effort per gear type
+lob_SI_effort <- lob_SI %>%
+  group_by(Fishing_gear) %>%
+  summarise(Effort = sum(Traps_no, na.rm = TRUE))
+
+#Calculate LPUE
+lob_SI_LPUE <- lob_SI_landed %>%
+  left_join(lob_SI_effort, by = c("Fishing_gear")) %>%
+  mutate(LPUE_SI = Landed / Effort)  
+
+lob_SI_LPUE <- lob_SI_LPUE %>%  #remove fishing methods that caught zero lobsters
+  filter(Landed > 0)
+  
+```
+
+This table shows the LPUE for the Caribbean Spinny Lobster based on short interview data. 
+
+```{r, echo=FALSE}
+pander(lob_SI_LPUE) 
+```
+
+```{r, include=FALSE}
+#3. COMPARING SHORT INTERVIEW & ONBOARD/PORT SAMPLING LPUE VALUES
+
+#Extract lobster data from onboard sampling LPUE
+lob_ON_LPUE <- lpue_data[lpue_data$Species_cn == "caribbean spiny lobster", ]
+
+lob_LPUE_compare <- lob_SI_LPUE %>%
+  left_join(lob_ON_LPUE, by = "Fishing_gear") %>%
+  transmute(Fishing_gear, LPUE_SI = LPUE_SI, LPUE_ON = LPUE, Difference = LPUE_SI - LPUE)
+
+      # -----> Almost no difference between onboard and short interview data reagrding lobster LPUE
+```
+
+
+This table shows the comparison between LPUE values for the Caribbean Spiny Lobster calculated based on (1) onboard and port sampling data and (2) short interview data. The small difference between LPUE values based on both data bases indicates that estimates provided by the fisherman during short interviews are very accurate.
+
+
+```{r, echo=FALSE}
+pander(head(lob_LPUE_compare)) 
+```
+
+
+# Total CPUE & LPUE over time
+
+```{r, include=FALSE}
+#TOTAL
+#Calculate total landings per date and gear
+total_landings_per_date_and_gear <- landed_data %>%
+  group_by(`Date (DD/MM/YYYY)`, Fishing_gear) %>%
+  summarise(
+    total_landings = n(),  #Count the remaining rows indicating actual catches
+    .groups = 'drop'
+  )
+
+#trap_range_per_date_and_gear_whole gives the effort per date and gear
+
+#calculate LPUE per date and gear over time
+lpue_over_time <- total_landings_per_date_and_gear %>%
+  left_join(trap_range_per_date_and_gear_whole, by = c("Date (DD/MM/YYYY)", "Fishing_gear")) %>%
+  mutate(
+    lpue = total_landings / max_trap  # Calculate LPUE: total landings divided by effort
+  )
+
+#Plot total LPUE over time
+lpue_tot_plot <- ggplot(lpue_over_time, aes(x = `Date (DD/MM/YYYY)`, y = lpue)) +
+  geom_line() + 
+  geom_point() +  
+  labs(
+    title = "Total LPUE Over Time 2024-2025",
+    x = "Date",
+    y = "LPUE (Landings per Unit Effort)"
+  ) +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+
+```
+
+
+These graphs show the total CPUE and LPUE over time. 
+
+```{r, echo=FALSE}
+#Display total CPUE and LPUE over time
+grid.arrange(cpue_tot_plot, lpue_tot_plot)
+```
+
+```{r, include=FALSE}
+#PER SPECIES
+#Calculate total landings per date and gear for one species of interest
+
+species_landing_per_date_and_gear <- landed_data %>%
+  filter(Species_cn == "coney") %>%    #Filter for species of interest 
+  group_by(`Date (DD/MM/YYYY)`, Fishing_gear) %>%          #Group by date and gear type
+  summarise(
+    total_landings = n(),                                  #Count the rows corresponding to the landings of this species
+    .groups = 'drop'  
+  )
+
+#trap_range_per_date_and_gear gives the effort per date and gear
+#calculate LPUE per date and gear over time
+species_lpue_over_time <- species_landing_per_date_and_gear %>%
+  left_join(trap_range_per_date_and_gear_whole, by = c("Date (DD/MM/YYYY)", "Fishing_gear")) %>%
+  mutate(
+    lpue = total_landings / max_trap  #Calculate LPUE: total landings divided by total effort
+  )
+
+```
+
+
+```{r, include=FALSE}
+#LPUE over time for selected species
+#Plot the LPUE over time for the species showing different gear types
+ggplot(species_lpue_over_time, aes(x = `Date (DD/MM/YYYY)`, y = lpue, color = Fishing_gear)) +   
+  geom_line() +  
+  geom_point() +  
+  labs(
+    title = "LPUE Over Time for Selected Species by Gear Type",
+    x = "Date",
+    y = "LPUE (Landings Per Unit Effort)"
+  ) + 
+  theme_minimal() +  
+  scale_color_brewer(palette = "Set1")  
+
+```
+
+## LPUE over time for 10 then most caught species
+
+```{r, include=FALSE}
+
+#IN A LOOP FOR THE TOP 10 SPECIES (IN CATCH NUMBERS)
+
+#Create an empty list to store the plots
+all_species_lpue_plots <- list()
+```
+
+```{r, echo=FALSE}
+#Loop through each species to create the CPUE plots
+for (species in species_list) {
+  
+  #Filter data for the specific species
+  species_landing_per_date_and_gear <- landed_data %>%
+    filter(Species_cn == species) %>%  #Filter for the species in the loop
+    group_by(`Date (DD/MM/YYYY)`, Fishing_gear) %>%  
+    summarise(
+      total_landings = n(),  #Count the rows corresponding to the catches of this species
+      .groups = 'drop'
+    )
+  
+  #Calculate LPUE per date and gear over time
+  species_lpue_over_time <- species_landing_per_date_and_gear %>%
+    left_join(trap_range_per_date_and_gear, by = c("Date (DD/MM/YYYY)", "Fishing_gear")) %>%
+    mutate(
+      lpue = total_landings / max_trap  # Calculate CPUE: total catch divided by total effort
+    )
+  
+  #Create the plot for the species and store it in the list
+  lpue_species_plot <- ggplot(species_lpue_over_time, aes(x = `Date (DD/MM/YYYY)`, y = lpue, color = Fishing_gear)) +   
+    geom_line() + 
+    geom_point() +  
+    labs(
+      title = paste(species),
+      x = "Date",
+      y = "LPUE"
+    ) + 
+    theme_minimal() +   
+    scale_color_manual(
+      values = c(
+        "LP" = "dodgerblue",  # Lobster gear is blue
+        "RP" = "red3",   # Redfish gear is red
+        "LP/MP" = "limegreen"  # Combined LP/MP is green
+      )) 
+    
+   print(lpue_species_plot) 
+   
+  #Add the plot to the list
+  all_species_lpue_plots[[species]] <- lpue_species_plot
+}
+
+```
+
+
+
+# Modeling CSL LPUE using short interview data
+
+## Marketable sized lobsters
+
+```{r, include=FALSE}
+
+#USING SHORT INTERVIEW DATA
+
+#LOB_SI_effort gives the effort
+#LOB_SI_landed gives the number of landed lobsters
+
+#1. DATA PREPERATION
+lob_SI_lp <- lob_SI[lob_SI$Fishing_gear=="LP",]               #Filter for LP
+lob_SI_lp <- lob_SI_lp[!is.na(lob_SI_lp$Fishing_area), ]      #Remove rows were area is unknown
+
+#Deal with trips that visit more than one area per trips --> Split & divide total catch equally among the areas
+#Division is done in such a way that no non-integer values are created
+
+# Initialize an empty list to store the new rows
+new_rows <- list()
+
+#Loop through each row in lob_SI_lp
+for(i in 1:nrow(lob_SI_lp)) {
+  
+  # Split the Fishing_area column based on "/"
+  areas <- unlist(strsplit(as.character(lob_SI_lp$Fishing_area[i]), split = "/"))
+  
+  #Check for multi-area trip
+  if(length(areas) > 1) {
+    
+    #Get total number of lobsters
+    total_lobsters <- lob_SI_lp$Lobster_no[i]
+    
+    # Compute base lobsters per area (integer division)
+    lobsters_per_area <- floor(total_lobsters / length(areas))
+    
+    # Compute remainder (lobsters that need to be distributed)
+    remainder <- total_lobsters %% length(areas)
+    
+    #Create new rows for each area
+    for(j in 1:length(areas)) {
+      new_row <- lob_SI_lp[i, ]  # Duplicate the current row
+      new_row$Fishing_area <- areas[j]  # Assign the current area
+      
+      #Distribute remainder fairly: First 'remainder' areas get 1 extra lobster
+      if (j <= remainder) {
+        new_row$Lobster_no <- lobsters_per_area + 1
+      } else {
+        new_row$Lobster_no <- lobsters_per_area
+      }
+      
+      # Add the new row to the list
+      new_rows <- append(new_rows, list(new_row))
+    }
+    
+  } else {
+    # If only one area is visited, just add the current row as is
+    new_rows <- append(new_rows, list(lob_SI_lp[i, ]))
+  }
+}
+
+# Combine all the new rows into a final dataframe
+lob_SI_lp <- do.call(rbind, new_rows)
+
+#2.DATA EXPLORATION
+
+#Look at distribution of variables
+#Soaking days
+ggplot(data = lob_SI_lp, aes(x = Soaking_time_days, fill = factor(Month))) +
+  geom_density(alpha = 0.5) + 
+  ggtitle("Distribution of Soaking Time")
+
+#Traps per trip
+ggplot(data = lob_SI_lp, aes(x = Traps_no, fill = factor(Month))) +
+  geom_density(alpha = 0.5) + 
+  ggtitle("Distribution of Number of Traps per Trip")
+
+#Catches per trip
+ggplot(data = lob_SI_lp, aes(x = Lobster_no, fill = factor(Month))) +
+  geom_density(alpha = 0.5) + 
+  ggtitle("Distribution of Number of Catches per Trip")
+
+#Add column of number of lobsters per trap (effort)
+lob_SI_lp$YperTrap  <- lob_SI_lp$Lobster_no / lob_SI_lp$Traps_no
+
+#Check dependence of soaking time on number of lobsters per trap 
+ggplot(data=lob_SI_lp,aes(x=Soaking_time_days,y=YperTrap)) +
+  geom_point() #--> soaking time seems independent of effort per trap
+
+#Plot number of lobsters against number of traps 
+ggplot(data=lob_SI_lp,aes(x=Traps_no,y=Lobster_no)) +
+ geom_point() +
+ geom_smooth(method = "loess", span=1.2)  
+
+
+#Remove rows where lobster no is unknown
+lob_SI_lp  <-    lob_SI_lp[!is.na(lob_SI_lp$Lobster_no),] 
+
+#table of how often each fishing ares was visited
+sort(table(lob_SI_lp$Fishing_area, useNA="always")) #Multiple areas are sometimes visited during one trip
+
+#3. CHECK FOR OUTLIERS
+dotchart(lob_SI$Lobster_no, main = "Lobster catches")         #number of lobster
+dotchart(log(lob_SI_lp$Traps_no), main = "no Traps log")      #number of traps
+
+#Log transform lobster_no & traps_no
+lob_SI_lp$logLob  <- log(lob_SI_lp$Lobster_no+0.1)
+lob_SI_lp$logTraps  <- log(lob_SI_lp$Traps_no+0.1)
+
+#4. CHECK VARIANCE HOMEGENEITY 
+#If variance is homogeneous, the spread of boxes (IQR) and whiskers should look similar across groups
+
+ggplot(lob_SI_lp,aes(factor(Month), logLob)) +      #log no of lobsters per month
+geom_boxplot()
+                                  
+ggplot(lob_SI_lp,aes(factor(Boat_name), logLob)) +   #log no of lobsters per boat
+geom_boxplot()
+
+mean(lob_SI_lp$Lobster_no, na.rm = TRUE) #---> 67.64453
+var(lob_SI_lp$Lobster_no, na.rm = TRUE)  #---> 1568.238
+
+#--> variance much larger than mean --> suggests overdispersion
+
+
+#5 TRY DIFFERENT MODELS AND COMPARE
+#'year' factor can be added when more data is available
+
+#M1: Poisson Regression 
+M1 <- glm(Lobster_no ~ factor(Month) + factor(Boat_name) + factor(Fishing_area) + logTraps, 
+          data = lob_SI_lp, 
+          family = "poisson")
+
+summary(M1) #AIC: 3124.6
+dispersiontest(M1) #p 2.2e-16 --> significant overdispersion --> poisson not good for this data
+
+#M2: Negative Binomial model
+M2 <- glm.nb(Lobster_no ~ factor(Month) + factor(Boat_name) + factor(Fishing_area) + logTraps, 
+             data = lob_SI_lp)
+
+summary(M2) #AIC: 2316.9
+
+#Get full model AIC and log-likelihood
+M2_AIC <- AIC(M2)
+M2_logLik <- logLik(M2)
+
+#--> Boats with significant effects: Navigator ***, Spirit of Saba ***, Lady Carolina ** & Highliner *
+#--> Month with significant effects: February **, November **, October *
+#--> Area's with significant effects: B5*, D5*
+
+#Log likelihood: Remove factors one by one and check model functioning
+
+#Get all predictors 
+predictors <- c("factor(Month)", "factor(Boat_name)", "factor(Fishing_area)", "logTraps")
+
+#Initialize results data frame
+M2_results <- data.frame(
+  Term_Removed = c("<none (full model)>", predictors),
+  Num_Parameters = c(length(coef(M2)), rep(NA, length(predictors))),
+  AIC = c(M2_AIC, rep(NA, length(predictors))),
+  LogLikelihoodRatio = c(NA, rep(NA, length(predictors))),
+  P_Value = c(NA, rep(NA, length(predictors))),
+  Significance_Level = c("", rep("", length(predictors)))
+)
+
+# Loop through each predictor and fit a reduced model
+for (i in seq_along(predictors)) {
+  pred <- predictors[i]
+  reduced_formula <- as.formula(paste("Lobster_no ~", paste(setdiff(predictors, pred), collapse = " + ")))
+  reduced_model <- glm.nb(reduced_formula, data = lob_SI_lp)
+  
+  # Calculate log-likelihood ratio test
+  logLik_reduced <- logLik(reduced_model)
+  LRT_stat <- -2 * (logLik_reduced - M2_logLik)
+  p_value <- pchisq(LRT_stat, df = abs(length(coef(M2)) - length(coef(reduced_model))), lower.tail = FALSE)
+  
+  # Determine significance level
+  sig_level <- ifelse(p_value < 0.001, "***",
+                      ifelse(p_value < 0.01, "**",
+                             ifelse(p_value < 0.05, "*", "")))
+  
+  # Store results
+  M2_results[i + 1, "Num_Parameters"] <- length(coef(reduced_model))
+  M2_results[i + 1, "AIC"] <- AIC(reduced_model)
+  M2_results[i + 1, "LogLikelihoodRatio"] <- as.numeric(LRT_stat)
+  M2_results[i + 1, "P_Value"] <- p_value
+  M2_results[i + 1, "Significance_Level"] <- sig_level
+}
+
+```
+
+```{r, echo=FALSE}
+# Print results
+pander(M2_results) 
+```
+
+```{r, include=FALSE}
+#Plotting residuals of M2
+residuals_M2 <- residuals(M2)
+plot(fitted(M2), residuals_M2, main="Residuals vs Fitted", xlab="Fitted values", ylab="Residuals")
+abline(h=0, col="red")  # Add a horizontal line at 0
+
+# Q-Q plot to check normality of residuals
+qqnorm(residuals_M2)
+qqline(residuals_M2, col = "red")
+
+#Make predictions using M2
+#use area and boat name that does NOT show a significant effect in the M2
+predat<-data.frame(Month="July",Boat_name="Rhiannon",logTraps=log(seq(min(lob_SI_lp$Traps_no),max(lob_SI_lp$Traps_no),by=1)),Fishing_area="B3")
+preds<-predict(M2, newdata = predat , type = "link", se = T)
+
+#Reversing the log transformation for plotting
+predat$fit <-  exp(preds$fit)
+predat$se  <-  exp(preds$se.fit)
+predat$lb  <-  exp(preds$fit - 2 * preds$se.fit)
+predat$ub  <-  exp(preds$fit + 2 * preds$se.fit)
+
+```
+
+```{r, echo=FALSE}
+#Modelling link between no traps and no catches
+M2_traps_catches <- ggplot(data = predat , aes(x=exp(logTraps)  ,  y = fit)) +
+  geom_ribbon(data = predat, aes(ymin=lb,ymax=ub,x=exp(logTraps)),
+                     alpha = 0.3) +
+  scale_colour_manual("",values="blue") +
+  scale_fill_manual("",values="grey12") +
+  geom_line(col="blue") +
+  xlab("Numb. Traps") + 
+  ylab("Numb. Lobster") + ggtitle ("Modelled link between number of traps and catches") +
+  geom_point(data=lob_SI_lp , aes(x=Traps_no  ,  y = Lobster_no),)
+
+print(M2_traps_catches)
+
+```
+
+```{r, include=FALSE}
+
+#MODDEL MONTH EFFECT
+#Define the months as numeric values
+#August has no data (2024-2025) so is not included
+m <- c("January", "February", "March", "April", "May", "June", "July", "September", "October", "November", "December")
+
+#Convert the Month column in lob_SI_lp to numeric values (1 = January, 2 = February, etc.)
+m2 <- lob_SI_lp$Month
+
+m2[lob_SI_lp$Month == "January"] <- 1
+m2[lob_SI_lp$Month == "February"] <- 2
+m2[lob_SI_lp$Month == "March"] <- 3
+m2[lob_SI_lp$Month == "April"] <- 4
+m2[lob_SI_lp$Month == "May"] <- 5
+m2[lob_SI_lp$Month == "June"] <- 6
+m2[lob_SI_lp$Month == "July"] <- 7
+m2[lob_SI_lp$Month == "September"] <- 8
+m2[lob_SI_lp$Month == "October"] <- 9
+m2[lob_SI_lp$Month == "November"] <- 10
+m2[lob_SI_lp$Month == "December"] <- 11
+
+m2 <- as.numeric(m2)
+
+# Add the numeric month values to the data frame
+lob_SI_lp$m2 <- m2
+
+#Create the predat data frame
+predat <- data.frame(
+  Month = m,  
+  Boat_name = "Rhiannon",
+  logTraps = log(mean(lob_SI_lp$Traps_no)), 
+  Fishing_area = "B3"
+)
+
+#Make predictions using the model M2
+preds <- predict(M2, newdata = predat, type = "link", se = TRUE)
+
+# Calculate fitted values, standard errors, and confidence intervals
+predat$fit <- exp(preds$fit)
+predat$se <- exp(preds$se.fit)
+predat$lb <- exp(preds$fit - 2 * preds$se.fit)
+predat$ub <- exp(preds$fit + 2 * preds$se.fit)
+
+# Add a numeric month column for plotting
+predat$month <- 1:11
+
+```
+
+```{r, echo=FALSE}
+
+# Now you can create the plot
+M2_month_effect <- ggplot(data = predat) +
+ geom_ribbon(aes(ymin = lb, ymax = ub, x = month), alpha = 0.3) +
+ geom_line(aes(x = month, y = fit), col = "blue") +
+ xlab("Month") + 
+ ylab("Numb. Lobster per standard trip") + 
+ ggtitle("Modelled month effect") +
+ scale_x_continuous(breaks = 1:11, labels = substr(m, 1, 3))  # Labels for months (e.g., Jan, Feb, Mar, etc.)
+
+print(M2_month_effect)
+
+```
+
+```{r, include=FALSE}
+#MODEL BOAT EFFECT
+#Define the boat names
+#No short interviews on Miss Lora yet so not included
+my.boats <- c("Blue Crush", "Bridgette", "Carolina Sofia", "Highliner", "Lady Carolina", 
+              "Mr Fish", "Navigator", "Rhiannon", "Second Wind", "Spirit of Saba")
+
+
+# Convert Boat_name into numeric values
+m2 <- lob_SI_lp$Boat_name
+
+m2[lob_SI_lp$Boat_name == "Blue Crush"]  <- 1
+m2[lob_SI_lp$Boat_name == "Bridgette"]  <- 2
+m2[lob_SI_lp$Boat_name == "Carolina Sofia"]  <- 3
+m2[lob_SI_lp$Boat_name == "Highliner"]  <- 4
+m2[lob_SI_lp$Boat_name == "Lady Carolina"]  <- 5
+m2[lob_SI_lp$Boat_name == "Mr Fish"]  <- 6
+m2[lob_SI_lp$Boat_name == "Navigator"]  <- 7
+m2[lob_SI_lp$Boat_name == "Rhiannon"]  <- 8
+m2[lob_SI_lp$Boat_name == "Second Wind"]  <- 9
+m2[lob_SI_lp$Boat_name == "Spirit of Saba"]  <- 10
+
+m2 <- as.numeric(m2)
+lob_SI_lp$m3 <- m2
+
+
+predat<-data.frame(Month="July",Boat_name=my.boats,logTraps=log(mean(lob_SI_lp$Traps_no)),Fishing_area="B3" )
+preds<-predict(M2, newdata = predat , type = "link", se = T)
+predat$fit  <-  exp(preds$fit)
+predat$se  <-  exp(preds$se.fit)
+predat$lb  <-  exp(preds$fit - 2 * preds$se.fit)
+predat$ub  <-  exp(preds$fit + 2 * preds$se.fit)
+predat$boat  <- 1:10
+
+```
+
+```{r, echo=FALSE}
+#Shows the predicted catch per both for the month July in B3
+#As a continues line
+M2_boat_effect <-  ggplot(data = predat) +
+ geom_ribbon(aes(ymin=lb,ymax=ub,x=boat),alpha = 0.3) +
+ geom_line(aes(x=boat,y=fit),col="blue") +
+ xlab("Boat") + 
+ ylab("Numb. Lobster") + 
+ ggtitle ("Modelled Boat effect") +
+ scale_x_continuous(breaks = 1:10, labels = paste("boat" , 1:length(my.boats)))
+
+print(M2_boat_effect)
+
+```
+
+```{r, include=FALSE}
+#As point data
+ggplot(data = predat) +
+  geom_pointrange(aes(x = Boat_name, y = fit, ymin = lb, ymax = ub), col = "blue") +
+  xlab("Boat") +
+  ylab("Number of Lobsters") +
+  ggtitle("Modelled Boat Effect") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x labels for better readability
+
+  
+
+#MODEL AREA EFFECT
+
+#Remove NA's
+lob_SI_lp <- lob_SI_lp[!is.na(lob_SI_lp$Fishing_area), ]
+
+#Check how many unique areas's
+unique_areas <- unique(lob_SI_lp$Fishing_area)
+length(unique_areas) 
+
+#Give a numerical code to the fishing area's
+area<-factor(lob_SI_lp$Fishing_area)
+init<-levels(area)
+levels(area) <- 1:13
+lob_SI_lp$area  <- as.numeric(area)
+
+predat<-data.frame(Month="July",Boat_name="Rhiannon",logTraps=log(mean(lob_SI_lp$Traps_no)),Fishing_area=unique(lob_SI_lp$Fishing_area))
+preds<-predict(M2, newdata = predat , type = "link", se = T)
+predat$fit  <-  exp(preds$fit)
+predat$se  <-  exp(preds$se.fit)
+predat$lb  <-  exp(preds$fit - 2 * preds$se.fit)
+predat$ub  <-  exp(preds$fit + 2 * preds$se.fit)
+
+#Check number of unique area's in the predict data
+unique(predat$Fishing_area)
+length(unique_areas) 
+
+predat$area <- factor(predat$Fishing_area)
+levels(predat$area)  <- 1:13
+predat$area<- as.numeric(predat$area)
+
+M2_area_effect <-  ggplot(data = predat) +
+ geom_ribbon(aes(ymin=lb,ymax=ub,x=area),alpha = 0.3) +
+ geom_line(aes(x=area,y=fit),col="blue") +
+ xlab("Fishing Area") +
+ ylab("Numb. Lobster") + 
+ ggtitle ("Modelled Year effect") 
+
+print(M2_area_effect)
+```
+
+```{r, echo=FALSE}
+ggplot(data = predat) + 
+  geom_pointrange(aes(x = Fishing_area, y = fit, ymin = lb, ymax = ub), col = "blue") + 
+  xlab("Fishing Area") +  # Corrected the label for the x-axis
+  ylab("Modelled Number of Lobsters per Month") + 
+  ggtitle("Modelled Area Effect") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x labels for better readability
+```
+
+
+## Undersized lobsters
+
+```{r, include=FALSE}
+#Preparing data
+lob_SI_shorts <- lob_SI[lob_SI$Fishing_gear=="LP",]
+lob_SI_shorts  <- lob_SI_shorts[!is.na(lob_SI_shorts$Lobster_undersized_no),] 
+
+
+#Deal with trips that visit more than one area per trips --> Split & devide total catch equally among the areas
+
+#Initialize an empty list to store the new rows
+new_rows <- list()
+
+# Loop through each row in lob_SI_lp
+for(i in 1:nrow(lob_SI_shorts)) {
+  
+  #Split the Fishing_area column based on  "/"
+  areas <- unlist(strsplit(as.character(lob_SI_shorts$Fishing_area[i]), split = "/"))
+  
+  #Check for multi area trip
+  if(length(areas) > 1) {
+    
+    #Divide the total Lobster_no equally among the new rows
+    lobsters_per_area <- lob_SI_shorts$Lobster_undersized_no[i] / length(areas)
+    
+    #Create new rows for each area
+    for(area in areas) {
+      new_row <- lob_SI_shorts[i, ]  # Duplicate the current row
+      new_row$Fishing_area <- area  # Assign the current area to the new row
+      new_row$Lobster_undersized_no <- lobsters_per_area  # Assign the divided Lobster_no to the new row
+      
+      #Add the new row to the list
+      new_rows <- append(new_rows, list(new_row))
+    }
+    
+  } else {
+    #If only one area is visited, just add the current row as is
+    new_rows <- append(new_rows, list(lob_SI_shorts[i, ]))
+  }
+}
+
+#Combine all the rows from the list into the final data frame and store it in lob_SI_lp
+lob_SI_shorts <- do.call(rbind, new_rows)
+
+#Calculate effort
+lob_SI_shorts$YperTrap  <- lob_SI_shorts$Lobster_undersized_no / lob_SI_shorts$Traps_no
+
+#Visual observation
+ggplot(data = lob_SI_shorts, aes(x = Lobster_undersized_no, fill = factor(Month))) +
+  geom_density(alpha = 0.5) + 
+  ggtitle("Distribution of Number of Undersized Catches per Trip")
+
+ggplot(data=lob_SI_shorts,aes(x=Soaking_time_days,y=YperTrap)) +
+  geom_point() #--> soaking time seems independent of effort per trap
+
+ggplot(data=lob_SI_shorts,aes(x=Traps_no,y=Lobster_undersized_no)) +
+  geom_point() +
+  geom_smooth(method = "loess", span=1.2)  #Number of traps seems independent on No undersized
+
+ggplot(data=lob_SI_shorts,aes(x=Month,y=Lobster_undersized_no)) +
+  geom_boxplot() 
+
+ggplot(data=lob_SI_shorts,aes(x=Fishing_area,y=Lobster_undersized_no)) +
+  geom_boxplot() 
+
+#Log transformation
+lob_SI_shorts$logLob_shorts  <- log(lob_SI_shorts$Lobster_undersized_no+1) #+1 because a lot of zero's
+lob_SI_shorts$logTraps  <- log(lob_SI_shorts$Traps_no+1)
+
+ggplot(lob_SI_shorts,aes(factor(Month), logLob_shorts)) +      #log no of lobsters per month
+  geom_boxplot()
+
+ggplot(lob_SI_shorts,aes(factor(Boat_name), logLob_shorts)) +   #log no of lobsters per boat
+  geom_boxplot()
+
+#Overdispersion check
+mean(lob_SI_shorts$Lobster_undersized_no, na.rm = TRUE) #---> 12.51493
+var(lob_SI_shorts$Lobster_undersized_no, na.rm = TRUE)  #---> 135.187
+
+#M2: Negative Binomial model
+M2_shorts <- glm.nb(Lobster_undersized_no ~ factor(Month) + factor(Boat_name) + factor(Fishing_area) + logTraps, 
+             data = lob_SI_shorts)
+
+summary(M2_shorts)
+
+#Get full model AIC and log-likelihood
+M2_shorts_AIC <- AIC(M2_shorts)
+M2_shorts_logLik <- logLik(M2_shorts)
+
+#LOG LIKELIHOOD RATIO TEST
+#Get all predictors 
+predictors <- c("factor(Month)", "factor(Boat_name)", "factor(Fishing_area)", "logTraps")
+
+#Initialize results data frame
+M2_shorts_results <- data.frame(
+  Term_Removed = c("<none (full model)>", predictors),
+  Num_Parameters = c(length(coef(M2_shorts)), rep(NA, length(predictors))),
+  AIC = c(M2_shorts_AIC, rep(NA, length(predictors))),
+  LogLikelihoodRatio = c(NA, rep(NA, length(predictors))),
+  P_Value = c(NA, rep(NA, length(predictors))),
+  Significance_Level = c("", rep("", length(predictors)))
+)
+
+#Loop through each predictor and fit a reduced model
+for (i in seq_along(predictors)) {
+  pred <- predictors[i]
+  reduced_formula <- as.formula(paste("Lobster_undersized_no ~", paste(setdiff(predictors, pred), collapse = " + ")))
+  reduced_model <- glm.nb(reduced_formula, data = lob_SI_lp)
+  
+  #Calculate log-likelihood ratio test
+  logLik_reduced <- logLik(reduced_model)
+  LRT_stat <- -2 * (logLik_reduced - M2_shorts_logLik)
+  p_value <- pchisq(LRT_stat, df = abs(length(coef(M2_shorts)) - length(coef(reduced_model))), lower.tail = FALSE)
+  
+  #Determine significance level
+  sig_level <- ifelse(p_value < 0.001, "***",
+                      ifelse(p_value < 0.01, "**",
+                             ifelse(p_value < 0.05, "*", "")))
+  
+  #Store results
+  M2_shorts_results[i + 1, "Num_Parameters"] <- length(coef(reduced_model))
+  M2_shorts_results[i + 1, "AIC"] <- AIC(reduced_model)
+  M2_shorts_results[i + 1, "LogLikelihoodRatio"] <- as.numeric(LRT_stat)
+  M2_shorts_results[i + 1, "P_Value"] <- p_value
+  M2_shorts_results[i + 1, "Significance_Level"] <- sig_level
+}
+```
+
+```{r, echo=FALSE}
+#Print results
+pander(M2_shorts_results)
+```
+
+```{r, include=FALSE}
+#Make predictions using M2
+#Modelling month effect
+#Define the months as numeric values
+m <- c("January", "February", "March", "April", "May", "June", "July", "September", "October", "November", "December")
+
+# Convert the Month column in lob_SI_shorts to numeric values (1 = January, 2 = February, etc.)
+m2 <- lob_SI_shorts$Month
+
+m2[lob_SI_shorts$Month == "January"] <- 1
+m2[lob_SI_shorts$Month == "February"] <- 2
+m2[lob_SI_shorts$Month == "March"] <- 3
+m2[lob_SI_shorts$Month == "April"] <- 4
+m2[lob_SI_shorts$Month == "May"] <- 5
+m2[lob_SI_shorts$Month == "June"] <- 6
+m2[lob_SI_shorts$Month == "July"] <- 7
+m2[lob_SI_shorts$Month == "September"] <- 8
+m2[lob_SI_shorts$Month == "October"] <- 9
+m2[lob_SI_shorts$Month == "November"] <- 10
+m2[lob_SI_shorts$Month == "December"] <- 11
+
+m2 <- as.numeric(m2)
+
+# Add the numeric month values to the data frame
+lob_SI_shorts$m2 <- m2
+
+# Create the predat data frame
+predat <- data.frame(Month = m,  
+                     Boat_name = "Rhiannon", 
+                     logTraps = log(mean(lob_SI_shorts$Traps_no)), 
+                     Fishing_area = "B3")
+
+# Make predictions using the model M2
+preds <- predict(M2_shorts, newdata = predat, type = "link", se = TRUE)
+
+# Calculate fitted values, standard errors, and confidence intervals
+predat$fit <- exp(preds$fit)
+predat$se <- exp(preds$se.fit)
+predat$lb <- exp(preds$fit - 2 * preds$se.fit)
+predat$ub <- exp(preds$fit + 2 * preds$se.fit)
+
+# Add a numeric month column for plotting
+predat$month <- 1:11
+
+```
+
+```{r, echo=FALSE}
+#Plotting
+M2_shorts_month_effect <- ggplot(data = predat) +
+  geom_ribbon(aes(ymin = lb, ymax = ub, x = month), alpha = 0.3) +
+  geom_line(aes(x = month, y = fit), col = "blue") +
+  xlab("Month") + 
+  ylab("Numb. of Undersized Lobster per standard trip") + 
+  ggtitle("Modelled month effect") + 
+  scale_x_continuous(breaks = 1:11, labels = substr(m, 1, 3))  # Labels for months (e.g., Jan, Feb, Mar, etc.)
+
+print(M2_shorts_month_effect)
+```
+
+```{r, include=FALSE}
+# Model Boat Effect
+# Define the boat names
+my.boats <- c("Blue Crush", "Bridgette", "Carolina Sofia", "Highliner", "Lady Carolina",  
+              "Mr Fish", "Navigator", "Rhiannon", "Second Wind", "Spirit of Saba")
+
+# Convert Boat_name into numeric values
+m2 <- lob_SI_shorts$Boat_name
+
+m2[lob_SI_shorts$Boat_name == "Blue Crush"]  <- 1
+m2[lob_SI_shorts$Boat_name == "Bridgette"]  <- 2
+m2[lob_SI_shorts$Boat_name == "Carolina Sofia"]  <- 3
+m2[lob_SI_shorts$Boat_name == "Highliner"]  <- 4
+m2[lob_SI_shorts$Boat_name == "Lady Carolina"]  <- 5
+m2[lob_SI_shorts$Boat_name == "Mr Fish"]  <- 6
+m2[lob_SI_shorts$Boat_name == "Navigator"]  <- 7
+m2[lob_SI_shorts$Boat_name == "Rhiannon"]  <- 8
+m2[lob_SI_shorts$Boat_name == "Second Wind"]  <- 9
+m2[lob_SI_shorts$Boat_name == "Spirit of Saba"]  <- 10
+
+m2 <- as.numeric(m2)
+lob_SI_shorts$m3 <- m2
+
+predat <- data.frame(Month = "March", 
+                     Boat_name = my.boats, 
+                     logTraps = log(mean(lob_SI_shorts$Traps_no)), 
+                     Fishing_area = "B3")
+
+preds <- predict(M2_shorts, newdata = predat, type = "link", se = TRUE)
+predat$fit  <- exp(preds$fit)
+predat$se  <- exp(preds$se.fit)
+predat$lb  <- exp(preds$fit - 2 * preds$se.fit)
+predat$ub  <- exp(preds$fit + 2 * preds$se.fit)
+predat$boat  <- 1:10
+
+#Shows the predicted catch per boat for the month of July in B3
+#As a continuous line
+M2_shorts_boat_effect <- ggplot(data = predat) +
+  geom_ribbon(aes(ymin = lb, ymax = ub, x = boat), alpha = 0.3) +
+  geom_line(aes(x = boat, y = fit), col = "blue") +
+  xlab("Boat") + 
+  ylab("Numb. of Undersized Lobster") + 
+  ggtitle("Modelled Boat effect") +
+  scale_x_continuous(breaks = 1:10, labels = paste("boat", 1:length(my.boats)))
+
+print(M2_shorts_boat_effect)
+```
+
+```{r, echo=FALSE}
+#As point data
+ggplot(data = predat) +
+  geom_pointrange(aes(x = Boat_name, y = fit, ymin = lb, ymax = ub), col = "blue") +
+  xlab("Boat") + 
+  ylab("Number of Undersized Lobsters") + 
+  ggtitle("Modelled Boat Effect") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x labels for better readability
+```
+
+```{r, include=FALSE}
+# Model Area Effect
+# Remove NAs
+lob_SI_shorts <- lob_SI_shorts[!is.na(lob_SI_shorts$Fishing_area), ]
+
+# Check how many unique areas
+unique_areas <- unique(lob_SI_shorts$Fishing_area)
+length(unique_areas)
+
+# Give a numerical code to the fishing areas
+area <- factor(lob_SI_shorts$Fishing_area)
+init <- levels(area)
+levels(area) <- 1:23
+lob_SI_shorts$area  <- as.numeric(area)
+
+predat <- data.frame(Month = "July", 
+                     Boat_name = "Spirit of Saba", 
+                     logTraps = log(mean(lob_SI_shorts$Traps_no)), 
+                     Fishing_area = unique(lob_SI_shorts$Fishing_area))
+
+preds <- predict(M2_shorts, newdata = predat, type = "link", se = TRUE)
+predat$fit  <- exp(preds$fit)
+predat$se  <- exp(preds$se.fit)
+predat$lb  <- exp(preds$fit - 2 * preds$se.fit)
+predat$ub  <- exp(preds$fit + 2 * preds$se.fit)
+
+# Check number of unique areas in the predict data
+unique(predat$Fishing_area)
+length(unique_areas)
+
+predat$area <- factor(predat$Fishing_area)
+levels(predat$area)  <- 1:13
+predat$area <- as.numeric(predat$area)
+
+M2_area_effect <- ggplot(data = predat) +
+  geom_ribbon(aes(ymin = lb, ymax = ub, x = area), alpha = 0.3) +
+  geom_line(aes(x = area, y = fit), col = "blue") +
+  xlab("Fishing Area") + 
+  ylab("Numb. Undersized Lobster") + 
+  ggtitle("Modelled Area effect")
+
+print(M2_area_effect)
+```
+
+```{r, echo=FALSE}
+ggplot(data = predat) + 
+  geom_pointrange(aes(x = Fishing_area, y = fit, ymin = lb, ymax = ub), col = "blue") + 
+  xlab("Fishing Area") +  # Corrected the label for the x-axis
+  ylab("Modelled Number of Undersized Lobsters per Area") + 
+  ggtitle("Modelled Area Effect") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x labels for better readability
+```
+
+
+## Berried lobsters
+
+```{r, include=FALSE}
+# Preparing data
+lob_SI_berried <- lob_SI[lob_SI$Fishing_gear == "LP",]
+lob_SI_berried <- lob_SI_berried[!is.na(lob_SI_berried$Lobster_berried_no),]
+lob_SI_berried <- lob_SI_berried[!is.na(lob_SI_berried$Fishing_area),]
+
+# Deal with trips that visit more than one area per trip -> Split & divide total catch equally among the areas
+
+# Initialize an empty list to store the new rows
+new_rows <- list()
+
+# Loop through each row in lob_SI_berried
+for (i in 1:nrow(lob_SI_berried)) {
+  
+  # Split the Fishing_area column based on "/"
+  areas <- unlist(strsplit(as.character(lob_SI_berried$Fishing_area[i]), split = "/"))
+  
+  # Check for multi-area trip
+  if (length(areas) > 1) {
+    
+    # Divide the total Lobster_berried_no equally among the new rows
+    lobsters_per_area <- lob_SI_berried$Lobster_berried_no[i] / length(areas)
+    
+    # Create new rows for each area
+    for (area in areas) {
+      new_row <- lob_SI_berried[i, ]  # Duplicate the current row
+      new_row$Fishing_area <- area  # Assign the current area to the new row
+      new_row$Lobster_berried_no <- lobsters_per_area  # Assign the divided Lobster_berried_no
+      
+      # Add the new row to the list
+      new_rows <- append(new_rows, list(new_row))
+    }
+    
+  } else {
+    # If only one area is visited, just add the current row as is
+    new_rows <- append(new_rows, list(lob_SI_berried[i, ]))
+  }
+}
+
+# Combine all the rows from the list into the final data frame
+lob_SI_berried <- do.call(rbind, new_rows)
+
+# Calculate effort
+lob_SI_berried$YperTrap <- lob_SI_berried$Lobster_berried_no / lob_SI_berried$Traps_no
+
+# Visual observation
+ggplot(data = lob_SI_berried, aes(x = Lobster_berried_no, fill = factor(Month))) +
+  geom_density(alpha = 0.5) + 
+  ggtitle("Distribution of Number of Berried Lobsters per Trip")
+
+ggplot(data=lob_SI_berried, aes(x=Soaking_time_days, y=YperTrap)) +
+  geom_point() # --> soaking time seems independent of effort per trap
+
+ggplot(data=lob_SI_berried, aes(x=Traps_no, y=Lobster_berried_no)) +
+  geom_point() +
+  geom_smooth(method = "loess", span=1.2)  # Number of traps seems independent of No. of berried lobsters
+
+ggplot(data=lob_SI_berried, aes(x=Month, y=Lobster_berried_no)) +
+  geom_boxplot() 
+
+ggplot(data=lob_SI_berried, aes(x=Fishing_area, y=Lobster_berried_no)) +
+  geom_boxplot() 
+
+# Log transformation
+lob_SI_berried$logLob_berried <- log(lob_SI_berried$Lobster_berried_no + 1) # +1 because of zeros
+lob_SI_berried$logTraps <- log(lob_SI_berried$Traps_no + 1)
+
+ggplot(lob_SI_berried, aes(factor(Month), logLob_berried)) +      # log no. of lobsters per month
+  geom_boxplot()
+
+ggplot(lob_SI_berried, aes(factor(Boat_name), logLob_berried)) +   # log no. of lobsters per boat
+  geom_boxplot()
+
+# Overdispersion check
+mean(lob_SI_berried$Lobster_berried_no, na.rm = TRUE)  # Check mean
+var(lob_SI_berried$Lobster_berried_no, na.rm = TRUE)   # Check variance
+
+# M2: Negative Binomial model
+M2_berried <- glm.nb(Lobster_berried_no ~ factor(Month) + factor(Boat_name) + factor(Fishing_area) + logTraps, 
+                     data = lob_SI_berried)
+
+summary(M2_berried)
+
+#Get full model AIC and log-likelihood
+M2_berried_AIC <- AIC(M2_berried)
+M2_berried_logLik <- logLik(M2_berried)
+
+# Get all predictors 
+predictors <- c("factor(Month)", "factor(Boat_name)", "factor(Fishing_area)", "logTraps")
+
+# Initialize results data frame
+M2_berried_results <- data.frame(
+  Term_Removed = c("<none (full model)>", predictors),
+  Num_Parameters = c(length(coef(M2_berried)), rep(NA, length(predictors))),
+  AIC = c(M2_berried_AIC, rep(NA, length(predictors))),
+  LogLikelihoodRatio = c(NA, rep(NA, length(predictors))),
+  P_Value = c(NA, rep(NA, length(predictors))),
+  Significance_Level = c("", rep("", length(predictors)))
+)
+
+# Loop through each predictor and fit a reduced model
+for (i in seq_along(predictors)) {
+  pred <- predictors[i]
+  reduced_formula <- as.formula(paste("Lobster_no ~", paste(setdiff(predictors, pred), collapse = " + ")))
+  reduced_model <- glm.nb(reduced_formula, data = lob_SI_lp)
+  
+  # Calculate log-likelihood ratio test
+  logLik_reduced <- logLik(reduced_model)
+  LRT_stat <- -2 * (logLik_reduced - M2_berried_logLik)
+  p_value <- pchisq(LRT_stat, df = abs(length(coef(M2_berried)) - length(coef(reduced_model))), lower.tail = FALSE)
+  
+  # Determine significance level
+  sig_level <- ifelse(p_value < 0.001, "***",
+                      ifelse(p_value < 0.01, "**",
+                             ifelse(p_value < 0.05, "*", "")))
+  
+  # Store results
+  M2_berried_results[i + 1, "Num_Parameters"] <- length(coef(reduced_model))
+  M2_berried_results[i + 1, "AIC"] <- AIC(reduced_model)
+  M2_berried_results[i + 1, "LogLikelihoodRatio"] <- as.numeric(LRT_stat)
+  M2_berried_results[i + 1, "P_Value"] <- p_value
+  M2_berried_results[i + 1, "Significance_Level"] <- sig_level
+}
+
+```
+
+```{r, echo=FALSE}
+# Print results
+pander(M2_berried_results)
+```
+
+```{r, include=FALSE}
+# Make predictions using M2
+# Modelling month effect
+# Define the months as numeric values
+m <- c("January", "February", "March", "April", "May", "June", "July", "September", "October", "November", "December")
+
+# Convert the Month column in lob_SI_berried to numeric values
+m2 <- lob_SI_berried$Month
+
+m2[lob_SI_berried$Month == "January"] <- 1
+m2[lob_SI_berried$Month == "February"] <- 2
+m2[lob_SI_berried$Month == "March"] <- 3
+m2[lob_SI_berried$Month == "April"] <- 4
+m2[lob_SI_berried$Month == "May"] <- 5
+m2[lob_SI_berried$Month == "June"] <- 6
+m2[lob_SI_berried$Month == "July"] <- 7
+m2[lob_SI_berried$Month == "September"] <- 8
+m2[lob_SI_berried$Month == "October"] <- 9
+m2[lob_SI_berried$Month == "November"] <- 10
+m2[lob_SI_berried$Month == "December"] <- 11
+
+m2 <- as.numeric(m2)
+
+# Add the numeric month values to the data frame
+lob_SI_berried$m2 <- m2
+
+# Create the predat data frame
+predat <- data.frame(Month = m,  
+                     Boat_name = "Rhiannon", 
+                     logTraps = log(mean(lob_SI_berried$Traps_no) + 1), 
+                     Fishing_area = "B3")
+
+
+# Make predictions using the model M2
+preds <- predict(M2_berried, newdata = predat, type = "link", se = TRUE)
+
+# Calculate fitted values, standard errors, and confidence intervals
+predat$fit <- exp(preds$fit)
+predat$se <- exp(preds$se.fit)
+predat$lb <- exp(preds$fit - 2 * preds$se.fit)
+predat$ub <- exp(preds$fit + 2 * preds$se.fit)
+
+# Add a numeric month column for plotting
+predat$month <- 1:11
+```
+
+```{r, echo=FALSE}
+# Now you can create the plot
+M2_berried_month_effect <- ggplot(data = predat) +
+  geom_ribbon(aes(ymin = lb, ymax = ub, x = month), alpha = 0.3) +
+  geom_line(aes(x = month, y = fit), col = "blue") +
+  xlab("Month") + 
+  ylab("Numb. of Berried Lobsters per standard trip") + 
+  ggtitle("Modelled Month Effect") + 
+  scale_x_continuous(breaks = 1:11, labels = substr(m, 1, 3))  
+
+print(M2_berried_month_effect)
+```
+
+```{r, include=FALSE}
+# Model Boat Effect
+my.boats <- c("Blue Crush", "Bridgette", "Carolina Sofia", "Highliner", "Lady Carolina",  
+              "Mr Fish", "Navigator", "Rhiannon", "Second Wind", "Spirit of Saba")
+
+m2 <- lob_SI_berried$Boat_name
+
+m2[lob_SI_berried$Boat_name == "Blue Crush"]  <- 1
+m2[lob_SI_berried$Boat_name == "Bridgette"]  <- 2
+m2[lob_SI_berried$Boat_name == "Carolina Sofia"]  <- 3
+m2[lob_SI_berried$Boat_name == "Highliner"]  <- 4
+m2[lob_SI_berried$Boat_name == "Lady Carolina"]  <- 5
+m2[lob_SI_berried$Boat_name == "Mr Fish"]  <- 6
+m2[lob_SI_berried$Boat_name == "Navigator"]  <- 7
+m2[lob_SI_berried$Boat_name == "Rhiannon"]  <- 8
+m2[lob_SI_berried$Boat_name == "Second Wind"]  <- 9
+m2[lob_SI_berried$Boat_name == "Spirit of Saba"]  <- 10
+
+m2 <- as.numeric(m2)
+lob_SI_berried$m3 <- m2
+
+predat <- data.frame(Month = "March",  
+                     Boat_name = my.boats,  
+                     logTraps = log(mean(lob_SI_berried$Traps_no) + 1),
+                     Fishing_area = "B3")
+
+preds <- predict(M2_berried, newdata = predat, type = "link", se = TRUE)
+predat$fit  <- exp(preds$fit)
+predat$se  <- exp(preds$se.fit)
+predat$lb  <- exp(preds$fit - 2 * preds$se.fit)
+predat$ub  <- exp(preds$fit + 2 * preds$se.fit)
+predat$boat  <- 1:10
+
+M2_berried_boat_effect <- ggplot(data = predat) +
+  geom_ribbon(aes(ymin = lb, ymax = ub, x = boat), alpha = 0.3) +
+  geom_line(aes(x = boat, y = fit), col = "blue") +
+  xlab("Boat") + 
+  ylab("Numb. of Berried Lobsters") + 
+  ggtitle("Modelled Boat Effect") + 
+  scale_x_continuous(breaks = 1:10, labels = paste("boat", 1:length(my.boats)))
+
+print(M2_berried_boat_effect)
+```
+
+```{r, echo=FALSE}
+ggplot(data = predat) +
+  geom_pointrange(aes(x = Boat_name, y = fit, ymin = lb, ymax = ub), col = "blue") +
+  xlab("Boat") +  
+  ylab("Number of Berried Lobsters") +  
+  ggtitle("Modelled Boat Effect") +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r, include=FALSE}
+# Model Area Effect
+lob_SI_berried <- lob_SI_berried[!is.na(lob_SI_berried$Fishing_area), ]
+
+area <- factor(lob_SI_berried$Fishing_area)
+init <- levels(area)
+levels(area) <- 1:length(init)
+lob_SI_berried$area  <- as.numeric(area)
+
+predat <- data.frame(Month = "July",  
+                     Boat_name = "Spirit of Saba",  
+                     logTraps = log(mean(lob_SI_berried$Traps_no) + 1),
+                     Fishing_area = unique(lob_SI_berried$Fishing_area))
+
+preds <- predict(M2_berried, newdata = predat, type = "link", se = TRUE)
+predat$fit  <- exp(preds$fit)
+predat$se  <- exp(preds$se.fit)
+predat$lb  <- exp(preds$fit - 2 * preds$se.fit)
+predat$ub  <- exp(preds$fit + 2 * preds$se.fit)
+
+predat$area <- factor(predat$Fishing_area)
+levels(predat$area)  <- 1:length(unique(predat$Fishing_area))
+predat$area <- as.numeric(predat$area)
+
+M2_berried_area_effect <- ggplot(data = predat) +
+  geom_ribbon(aes(ymin = lb, ymax = ub, x = area), alpha = 0.3) +
+  geom_line(aes(x = area, y = fit), col = "blue") +
+  xlab("Fishing Area") +  
+  ylab("Numb. of Berried Lobsters") +  
+  ggtitle("Modelled Area Effect")
+
+print(M2_berried_area_effect)
+
+```
+
+```{r, echo=FALSE}
+ggplot(data = predat) +
+  geom_pointrange(aes(x = Fishing_area, y = fit, ymin = lb, ymax = ub), col = "blue") +
+  xlab("Area") +  
+  ylab("Numb. of Berried Lobsters") +  
+  ggtitle("Modelled Area Effect") +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+### LPUE - modelling Redfish landings
+
+```{r, include=FALSE}
+
+#reload short interview data
+lob_SI <- read_sheet(sheet_url, sheet = "ShortInterview", col_names = FALSE)  
+lob_SI <- lob_SI %>% 
+  row_to_names(row_number = 2) 
+
+#Fix 'date' column
+lob_SI <- lob_SI[!sapply(lob_SI$`Date (d/m/y)`, is.null), ]
+lob_SI$`Date (d/m/y)` <- unlist(lob_SI$`Date (d/m/y)`)
+lob_SI$`Date (d/m/y)` <- as.POSIXct(lob_SI$`Date (d/m/y)`, origin = "1970-01-01", tz = "UTC")
+
+#Subset for useful variables
+lob_SI.vars <- c("Date (d/m/y)","Month",
+                 "Boat_name", "Fishing_gear", "Trip_ID",
+                 "Fishing_area","Depth_m_min","Depth_m_max",
+                 "Soaking_time_days","Traps_no", "Traps_lost_no",
+                 "Lobster_no","Lobster_berried_no","Lobster_undersized_no", "Redfish_lbs")
+
+lob_SI  <- lob_SI[,lob_SI.vars]
+
+#Fix structure 
+cols_to_fix <- c("Depth_m_min", "Depth_m_max", 
+                 "Soaking_time_days", "Traps_no", "Traps_lost_no",
+                 "Lobster_no", "Lobster_berried_no", "Lobster_undersized_no", "Redfish_lbs")
+
+lob_SI <- lob_SI %>%
+  mutate(across(all_of(cols_to_fix), ~ as.numeric(sapply(., function(x) ifelse(is.null(x), NA, x)))))
+
+
+#Removing trip_id's corresponding to onboard monitoring (goal is to compare onboard and short interview data)
+matching_rows <- lob_SI %>%
+  filter(Trip_ID %in% onboard_trip_ids) %>%
+  nrow()
+
+print(paste("Number of matching rows:", matching_rows)) #check how many rows will be removed
+
+lob_SI <- lob_SI %>%
+  filter(!Trip_ID %in% onboard_trip_ids) #remove the rows 
+
+#1. DATA PREPERATION
+lob_SI_rp <- lob_SI[lob_SI$Fishing_gear=="RP",]               #Filter for RP
+lob_SI_rp <- lob_SI_rp[!is.na(lob_SI_rp$Fishing_area), ]      #Remove rows were area is unknown
+
+#Deal with trips that visit more than one area per trips --> Split & divide total catch equally among the areas
+#Division is done in such a way that no non-integer values are created
+
+# Initialize an empty list to store the new rows
+new_rows <- list()
+
+#Loop through each row in lob_SI_lp
+for(i in 1:nrow(lob_SI_rp)) {
+  
+  # Split the Fishing_area column based on "/"
+  areas <- unlist(strsplit(as.character(lob_SI_rp$Fishing_area[i]), split = "/"))
+  
+  #Check for multi-area trip
+  if(length(areas) > 1) {
+    
+    #Get total number of lobsters
+    total_redfish <- lob_SI_rp$Redfish_lbs[i]
+    
+    # Compute base lobsters per area (integer division)
+    redfish_per_area <- floor(total_redfish / length(areas))
+    
+    # Compute remainder (lobsters that need to be distributed)
+    remainder <- total_redfish %% length(areas)
+    
+    #Create new rows for each area
+    for(j in 1:length(areas)) {
+      new_row <- lob_SI_rp[i, ]  # Duplicate the current row
+      new_row$Fishing_area <- areas[j]  # Assign the current area
+      
+      #Distribute remainder fairly: First 'remainder' areas get 1 extra lobster
+      if (j <= remainder) {
+        new_row$Redfish_lbs <- redfish_per_area + 1
+      } else {
+        new_row$Redfish_lbs <- redfish_per_area
+      }
+      
+      # Add the new row to the list
+      new_rows <- append(new_rows, list(new_row))
+    }
+    
+  } else {
+    # If only one area is visited, just add the current row as is
+    new_rows <- append(new_rows, list(lob_SI_rp[i, ]))
+  }
+}
+
+# Combine all the new rows into a final dataframe
+lob_SI_rp <- do.call(rbind, new_rows)
+
+
+#2.DATA EXPLORATION
+#Look at distribution of variables
+#Traps per trip - month
+ggplot(data = lob_SI_rp, aes(x = Traps_no, fill = factor(Month))) +
+  geom_density(alpha = 0.5) + 
+  ggtitle("Distribution of Number of Traps per Trip")
+
+#Traps per trip - boat
+ggplot(data = lob_SI_rp, aes(x = Traps_no, fill = factor(Boat_name))) +
+  geom_density(alpha = 0.5) + 
+  ggtitle("Distribution of Number of Traps per Trip")
+
+#Catches per trip - month
+ggplot(data = lob_SI_rp, aes(x = Redfish_lbs, fill = factor(Month))) +
+  geom_density(alpha = 0.5) + 
+  ggtitle("Distribution of Number of Catches per Trip")
+
+#Catches per trip - boat
+ggplot(data = lob_SI_rp, aes(x = Redfish_lbs, fill = factor(Boat_name))) +
+  geom_density(alpha = 0.5) + 
+  ggtitle("Distribution of Number of Catches per Trip")
+
+#How many trips per month?
+month_levels <- c("January", "February", "March", "April", "May", "June", 
+                  "July", "August", "September", "October", "November", "December")
+
+month_counts <- lob_SI_rp %>%
+  count(Month)
+
+month_counts$Month <- factor(month_counts$Month, levels = month_levels)
+
+ggplot(month_counts, aes(x = Month, y = n, fill = Month)) +  
+  geom_bar(stat = "identity") +  
+  labs(title = "Number Redfish trips per month", x = "Month", y = "No trips") +  
+  theme_minimal() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+
+#How many trips per boat?
+boat_counts <- lob_SI_rp %>%
+  count(Boat_name)
+
+ggplot(boat_counts, aes(x = Boat_name, y = n, fill = Boat_name)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Number of trips", x = "Boat name", y = "Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+
+
+#Add column Redfish lbs per trap (effort)
+lob_SI_rp$YperTrap  <- lob_SI_rp$Redfish_lbs / lob_SI_rp$Traps_no
+
+#Check dependence of soaking time on lbs of redfish per trap 
+ggplot(data=lob_SI_rp,aes(x=Soaking_time_days,y=YperTrap)) +
+  geom_point() #--> soaking time seems independent of effort per trap
+
+#Plot lbs redfish against number of traps 
+ggplot(data=lob_SI_rp,aes(x=Traps_no,y=Redfish_lbs)) +
+  geom_point() +
+  geom_smooth(method = "loess", span=1.2)  
+
+#3. CHECK FOR OUTLIERS
+dotchart(lob_SI_rp$Redfish_lbs, main = "Redfish Lbs")         #number of lobster
+dotchart(log(lob_SI_rp$Traps_no), main = "no Traps log")      #number of traps
+
+#Log transform lobster_no & traps_no
+lob_SI_rp$logRed  <- log(lob_SI_rp$Redfish_lbs+0.1)
+lob_SI_rp$logTraps  <- log(lob_SI_rp$Traps_no+0.1)
+
+#4. CHECK VARIANCE HOMEGENEITY 
+#If variance is homogeneous, the spread of boxes (IQR) and whiskers should look similar across groups
+ggplot(lob_SI_rp,aes(factor(Month), logRed)) +      #log no of lobsters per month
+  geom_boxplot()
+
+ggplot(lob_SI_rp,aes(factor(Boat_name), logRed)) +   #log no of lobsters per boat
+  geom_boxplot()
+
+mean(lob_SI_rp$Redfish_lbs, na.rm = TRUE) #---> 138.3841
+var(lob_SI_rp$Redfish_lbs, na.rm = TRUE)  #---> 8688.209
+sd(lob_SI_rp$Redfish_lbs, na.rm = TRUE)   #---> 93.21056
+
+
+hist(lob_SI_rp$Redfish_lbs) #right skewed
+hist(lob_SI_rp$logRed) #left skewed
+lob_SI_rp$sqrt_Redfish_lbs <- sqrt(lob_SI_rp$Redfish_lbs + abs(min(lob_SI_rp$Redfish_lbs)) + 1)
+hist(lob_SI_rp$sqrt_Redfish_lbs) #sqrt transformation results in normal distributed data
+
+#--> variance much larger than mean --> suggests overdispersion
+
+#5 TRY DIFFERENT MODELS AND COMPARE
+#'year' factor can be added when more data is available
+
+#M1: Poisson Regression 
+M1 <- glm(Redfish_lbs ~ factor(Month) + factor(Boat_name) + factor(Fishing_area) + logTraps, 
+          data = lob_SI_rp, 
+          family = "poisson")
+
+summary(M1) #AIC: 3075.6
+dispersiontest(M1) #p 2.2e-16 --> significant overdispersion --> poisson not good for this data
+
+#M2: Negative Binomial model
+#Full model
+M2 <- glm.nb(Redfish_lbs ~ factor(Month) + factor(Boat_name) + factor(Fishing_area) + logTraps, 
+             data = lob_SI_rp)
+
+summary(M2) #AIC: 1521.4
+
+# Define full model
+M3 <- glm(sqrt_Redfish_lbs ~ factor(Fishing_area) + factor(Boat_name) + factor(Month) + logTraps, 
+          data = lob_SI_rp, 
+          family = gaussian(link = "identity"))
+
+summary(M3)
+
+# Store AIC & Log Likelihood of full model
+M3_AIC <- AIC(M3)
+M3_logLik <- logLik(M3)
+
+# Define predictors
+predictors <- c("factor(Fishing_area)", "factor(Boat_name)", "factor(Month)", "logTraps")
+
+# Initialize results data frame
+M3_results <- data.frame(
+  Term_Removed = c("<none (full model)>", predictors),
+  Num_Parameters = c(length(coef(M3)), rep(NA, length(predictors))),
+  AIC = c(M3_AIC, rep(NA, length(predictors))),
+  LogLikelihoodRatio = c(NA, rep(NA, length(predictors))),
+  P_Value = c(NA, rep(NA, length(predictors))),
+  Significance_Level = c("", rep("", length(predictors)))
+)
+
+# Loop through each predictor and fit a reduced model
+for (i in seq_along(predictors)) {
+  pred <- predictors[i]
+  reduced_formula <- as.formula(paste("sqrt_Redfish_lbs ~", paste(setdiff(predictors, pred), collapse = " + ")))
+  
+  # Fit reduced model
+  reduced_model <- glm(reduced_formula, data = lob_SI_rp, family = gaussian(link = "identity"))
+  
+  # Calculate log-likelihood ratio test
+  logLik_reduced <- logLik(reduced_model)
+  LRT_stat <- -2 * (logLik_reduced - M3_logLik)
+  p_value <- pchisq(LRT_stat, df = abs(length(coef(M3)) - length(coef(reduced_model))), lower.tail = FALSE)
+  
+  # Determine significance level
+  sig_level <- ifelse(p_value < 0.001, "***",
+                      ifelse(p_value < 0.01, "**",
+                             ifelse(p_value < 0.05, "*", "")))
+  
+  # Store results
+  M3_results[i + 1, "Num_Parameters"] <- length(coef(reduced_model))
+  M3_results[i + 1, "AIC"] <- AIC(reduced_model)
+  M3_results[i + 1, "LogLikelihoodRatio"] <- as.numeric(LRT_stat)
+  M3_results[i + 1, "P_Value"] <- p_value
+  M3_results[i + 1, "Significance_Level"] <- sig_level
+}
+
+#Print results --> month is not significant so to improve (simplify) the model we fit is without using month
+#also because effort are zero in july and feb and very low during winter (red fish closure season)
+print(M3_results)
+
+#Refit the model without factor(Month)
+M4 <- glm(sqrt_Redfish_lbs ~ factor(Fishing_area) + factor(Boat_name) + logTraps,  
+          data = lob_SI_rp,  
+          family = gaussian(link = "identity"))  
+
+summary(M4)
+AIC(M4)
+
+#Checking residuals
+hist(resid(M4))
+qqnorm(resid(M4))
+plot(M4, which = 3)  # Plot residuals vs. fitted values
+residuals_M4 <- residuals(M4)
+plot(fitted(M4), residuals_M4, main="Residuals vs Fitted", xlab="Fitted values", ylab="Residuals")
+abline(h=0, col="red")  # Add a horizontal line at 0
+
+#Q-Q plot to check normality of residuals
+qqnorm(residuals_M4)
+qqline(residuals_M4, col = "red")
+
+#Make predictions using the model
+#BOAT EFFECT
+# No short interviews on Miss Lora yet, so not included
+my.boats <- c("Bridgette", "Carolina Sofia", "Highliner", "Lady Carolina",  
+              "Mr Fish", "Navigator", "Second Wind", "Spirit of Saba")
+
+#Convert Boat_name into numeric values
+#Currently without Rhiannon and Blue Crush because they haven't done any Redfish trips, adjust accordingly if this changes
+m4 <- lob_SI_rp$Boat_name  
+
+m4[lob_SI_rp$Boat_name == "Bridgette"]  <- 1
+m4[lob_SI_rp$Boat_name == "Carolina Sofia"]  <- 2
+m4[lob_SI_rp$Boat_name == "Highliner"]  <- 3
+m4[lob_SI_rp$Boat_name == "Lady Carolina"]  <- 4
+m4[lob_SI_rp$Boat_name == "Mr Fish"]  <- 5
+m4[lob_SI_rp$Boat_name == "Navigator"]  <- 6
+m4[lob_SI_rp$Boat_name == "Second Wind"]  <- 7
+m4[lob_SI_rp$Boat_name == "Spirit of Saba"]  <- 8
+
+m4 <- as.numeric(m4)
+lob_SI_rp$m4 <- m4  
+
+#Define your new data for prediction
+predat <- data.frame(Boat_name = my.boats,
+                     logTraps = mean(lob_SI_rp$logTraps),
+                     Fishing_area = "B3")
+
+#Get predictions from the model on the transformed scale (sqrt)
+preds <- predict(M4, newdata = predat, type = "link", se = TRUE)
+
+#Retransform the predictions back to the original scale (pounds)
+predat$predicted_lbs <- preds$fit^2  # Square the predictions to reverse the sqrt transformation
+
+#Retransform the confidence intervals (lower and upper bounds)
+#Now you have the predictions and confidence intervals on the original scale (lbs)
+predat$lb_predicted_lbs <- (preds$fit - 2 * preds$se.fit)^2  # Lower bound re-transformed
+predat$ub_predicted_lbs <- (preds$fit + 2 * preds$se.fit)^2  # Upper bound re-transformed
+```
+
+```{r, echo=FALSE}
+ggplot(data = predat) +
+  geom_pointrange(aes(x = Boat_name, y = predicted_lbs, ymin = lb_predicted_lbs, ymax = ub_predicted_lbs), 
+                  col = "blue") +
+  xlab("Fishing Area") + 
+  ylab("Modelled Weight of Redfish (lbs) per trip") +  
+  ggtitle("Modelled Boat Effect on Redfish Weight") +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  
+
+#MODEL AREA EFFECT
+#Remove NA's
+lob_SI_rp <- lob_SI_rp[!is.na(lob_SI_rp$Fishing_area), ]
+
+#Relevel Fishing_area as a factor
+area <- factor(lob_SI_rp$Fishing_area)
+init <- levels(area)
+levels(area) <- 1:length(init)
+lob_SI_rp$area <- as.numeric(area)
+
+# Create the prediction dataframe for the area effect model (e.g., "Spirit of Saba")
+predat <- data.frame(
+  Boat_name = "Spirit of Saba",  
+  logTraps = mean(lob_SI_rp$logTraps),  
+  Fishing_area = unique(lob_SI_rp$Fishing_area)  # List of unique Fishing areas
+)
+
+#Use model M4 to predict
+preds <- predict(M4, newdata = predat, type = "link", se = TRUE)
+
+#Back-transform the predictions and their standard errors
+predat$predicted_lbs  <- preds$fit^2  # Back-transformed fitted values
+predat$Standard_error <- preds$se^2   # Back-transformed standard errors
+
+#Calculate 95% confidence intervals
+predat$lb_predicted_lbs <- (preds$fit - 2 * preds$se.fit)^2  # Lower bound re-transformed
+predat$ub_predicted_lbs <- (preds$fit + 2 * preds$se.fit)^2  # Upper bound re-transformed
+
+#Relevel Fishing_area as a factor for plotting
+predat$area <- factor(predat$Fishing_area)
+levels(predat$area) <- 1:length(unique(predat$Fishing_area))
+predat$area <- as.numeric(predat$area)  # For model use, but plot using the factor level
+```
+
+```{r, echo=FALSE}
+#Plot area effect
+ggplot(data = predat) + 
+  geom_pointrange(aes(x = Fishing_area, y = predicted_lbs, ymin = lb_predicted_lbs, ymax = ub_predicted_lbs), col = "blue") + 
+  xlab("Fishing Area") +  # Corrected the label for the x-axis
+  ylab("Modelled lbs Redfish per area") + 
+  ggtitle("Modelled Area Effect") + 
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate x labels for better readability
+```
+
+## Fishing pressure
+All snappers (Vermillion, Lane, Blackfin and Silk) are over fished. Both male and female Caribbean Spiny Lobsters are currently fished at a sustainable level. Error bars for Red Hind and Queen triggerfish indicate fising pressure at maximum Linf, showing that depending on if max Linf or min Linf is used species can be marked as either or over fished. Small differences in fishing pressure between different fishing gears exists for both of these species. 
+
+
+```{r, include=FALSE}
+#preparation: list of species that we will calculate the fishing pressure for --> those with known Linf
+
+#preparation: list of species that we will calculate the fishing pressure for --> those with known Linf
+
+#List of target species (common names)
+target_species <- c(  
+  "blue tang", 
+  "cottonwick", 
+  "doctorfish",    
+  "ocean surgeonfish",    
+  "white grunt", 
+  "queen triggerfish", 
+  "red hind",
+  "caribbean spiny lobster", 
+  "blackfin snapper",    
+  "yelloweye snapper", 
+  "lane snapper", 
+  "vermillion snapper"  
+)
+
+
+#Define species that need gear-specific calculations
+species_gear_specific <- c("red hind", "queen triggerfish")
+
+
+#Modify data set: keep gear info for specific species, aggregate others under "All Gears"
+target_species_FP <- expanded_data %>% 
+  filter(  
+    Species_cn %in% target_species,  
+    !is.na(Length)                   #Remove NAs in Length
+  ) %>% 
+  mutate(  
+    Fishing_gear = if_else(Species_cn %in% species_gear_specific, Fishing_gear, "All Gears")  # Assign "All Gears" to non-target species
+  ) %>%
+  filter( 
+    !(Species_cn == "caribbean spiny lobster" & is.na(Sex))  #Remove rows with unknown sex for CSL
+  )
+
+target_species_FP <- target_species_FP %>%
+  mutate(Species_cn = case_when(
+    Species_cn == "caribbean spiny lobster" & Sex == "M" ~ "csl male",
+    Species_cn == "caribbean spiny lobster" & Sex == "F" ~ "csl female",
+    TRUE ~ Species_cn  # Keep original Species_cn for other rows
+  ))
+
+
+#Calculate mean length for target species by sex
+mean_length_target_species_FP <- target_species_FP %>% 
+  group_by(Species_cn, Fishing_gear) %>%  
+  summarise(Lmean = mean(Length, na.rm = TRUE), .groups = "drop")
+
+#Create length frequency distribution
+length_frequency <- target_species_FP %>% 
+  group_by(Species_cn, Fishing_gear, Length) %>%  
+  summarise(count = n(), .groups = "drop")
+
+
+#Add modal frequency and define the threshold (50% of modal frequency)
+length_frequency_with_modal <- length_frequency %>% 
+  group_by(Species_cn, Fishing_gear) %>%  
+  mutate(  
+    modal_frequency = max(count, na.rm = TRUE),
+    threshold = modal_frequency * 0.5
+  )
+
+#Add cumulative frequency
+length_frequency_cumulative <- length_frequency_with_modal %>% 
+  arrange(Length) %>% 
+  group_by(Species_cn, Fishing_gear) %>%  
+  mutate(cumulative_frequency = cumsum(count))
+
+
+#For other species, calculate Lc without Sex differentiation
+lc_values <- length_frequency_cumulative %>% 
+  filter(cumulative_frequency >= threshold) %>%  # Apply threshold
+  group_by(Species_cn, Fishing_gear) %>%  # Group by species and fishing gear, no Sex here
+  summarise(Lc = min(Length), .groups = "drop")  # Calculate Lc for other species
+
+
+#Obtain Linf data from the google sheets
+Linf_data <- read_sheet(sheet_url, sheet = "Linf_values")
+
+Linf_data <- Linf_data %>% 
+  mutate(
+    Species_cn = tolower(Species_cn),
+    Species_sn = tolower(Species_sn)
+  )
+
+#Calculate fishing pressure. For Red Hind and Queen trigger fish this is done per gear type
+fishing_pressure_data <- lc_values %>% 
+  left_join(Linf_data, by = "Species_cn", relationship = "many-to-many") %>% 
+  subset(select = -c(source...6, source...9, comment))
+
+
+fishing_pressure_data <- fishing_pressure_data %>%
+  mutate(
+    Lfmin = 0.75 * Lc + 0.25 * Linf_min,
+    Lfmax = 0.75 * Lc + 0.25 * Linf_max
+  )
+
+fishing_pressure_data <- fishing_pressure_data %>%
+  left_join(mean_length_target_species_FP, by = c("Species_cn", "Fishing_gear")) %>%
+  mutate(
+    fishing_pressure_min = Lfmin / Lmean,
+    fishing_pressure_max = Lfmax / Lmean
+  )
+
+
+#Assign status (underfished/overfished/sustainable) based on Fp value
+fishing_pressure_data <- fishing_pressure_data %>%
+  mutate(
+    FP_status_min = case_when(
+      fishing_pressure_min < 0.9 ~ "Underfished",
+      fishing_pressure_min > 1.1 ~ "Overfished",
+      TRUE ~ "Sustainable"
+    ),
+    FP_status_max = case_when(
+      is.na(fishing_pressure_max) ~ NA_character_,
+      fishing_pressure_max < 0.9 ~ "Underfished",
+      fishing_pressure_max > 1.1 ~ "Overfished",
+      TRUE ~ "Sustainable"
+    )
+  )
+```
+
+```{r, echo=FALSE}
+pander(fishing_pressure_data)
+pander(fishing_pressure_data[c("fishing_pressure_min", "fishing_pressure_max", "Species_cn")])
+```
+
+```{r, echo=FALSE}
+#Visualize fishing pressure
+
+#Define a custom order for species (putting Queen Trigger fish & Red Hind last)
+custom_order <- c(
+  unique(fishing_pressure_data$Species_cn[fishing_pressure_data$Species_cn != "Queen Triggerfish" & 
+                                            fishing_pressure_data$Species_cn != "Red Hind"]), 
+  "Queen Triggerfish", "Red Hind"
+)
+
+ggplot(fishing_pressure_data, aes(
+  x = factor(Species_cn, levels = custom_order),  # Custom order
+  y = fishing_pressure_min, 
+  fill = Fishing_gear  # Color by gear type
+)) + 
+  geom_col(position = position_dodge(width = 0.8)) +  # Keeps bars separate per gear
+  geom_errorbar(aes(ymin = fishing_pressure_min, ymax = fishing_pressure_max), 
+                width = 0.2, color = "black", 
+                position = position_dodge(width = 0.8)) +  
+  geom_hline(yintercept = 1, linetype = "dashed", color = "red", linewidth = 1.0) +  
+  scale_fill_manual(values = c(
+    "All Gears" = "#8B4789",
+    "LP" = "dodgerblue",
+    "RP" = "red3",
+    "LP/MP" = "limegreen"
+  )) +  # Custom colors for gear types
+  labs(
+    title = "Fishing Pressure per Species",
+    x = "Species",
+    y = "Fishing Pressure"
+  ) +  
+  theme_minimal() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))  # Rotate labels for readability
+
+```
+
+## Boat representation
+
+There are large differences in boat representation for both short interviews and onboard monitoring trips. Most onboard monitoring trips are onboard of Rhiannon, while no onboard trips where done on both Miss Lora and Navigator. For short interviews the contribution of boats is a bit more equal, however Miss Lora, Blue Crush and Highler are under represented. 
+
+
+```{r, include=FALSE}
+#Short interview
+boat_trip_counts_SI <- lob_SI %>%
+  group_by(Boat_name) %>%
+  summarise(Unique_Trips = n_distinct(Trip_ID), .groups = "drop")
+
+```
+
+```{r, include=FALSE}
+
+#Define colour scheme that will be used
+default_colors <- hue_pal()(11)  
+print(default_colors)
+boat_colors <- c(
+  "Blue Crush" = "#F8766D",   # Red
+  "Bridgette" = "#DB8E00",    # Orange
+  "Carolina Sofia" = "#AEA200", # Yellow
+  "Highliner" = "#64B200",    # Light Green
+  "Lady Carolina" = "#00BD5C", # Green
+  "Miss Lora" = "#00C1A7",    # Teal
+  "Mr Fish" = "#00BADE",      # Light Blue
+  "Navigator" = "#00A6FF",    # Blue
+  "Rhiannon" = "#B385FF",     # Purple
+  "Second Wind" = "#EF67EB",  # Pink
+  "Spirit of Saba" = "#FF63B6" # Magenta
+)
+
+
+boat_effort_si <- ggplot(boat_trip_counts_SI, aes(x = Boat_name, y = Unique_Trips, fill = Boat_name)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Contribution per boat - Short Interviews",
+       x = "Boat Name",
+       y = "Number of interviews",
+       fill = "Boat Name") +
+  scale_fill_manual(values = boat_colors) +  
+  theme_minimal() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+
+#Onboard monitoring
+boat_trip_counts_ONBOARD <- data %>%
+  filter(`Gridboard/Onboard` == "ONBOARD") %>%
+  group_by(Boat_name) %>%
+  summarise(Unique_Trips = n_distinct(Trip_ID), .groups = "drop")
+
+boat_effort_onboard <- ggplot(boat_trip_counts_ONBOARD, aes(x = Boat_name, y = Unique_Trips, fill = Boat_name)) +
+  geom_bar(stat = "identity", position = "dodge") +
+  labs(title = "Contribution per boat - Onboard sampling",
+       x = "Boat Name",
+       y = "Number of onboard trips",
+       fill = "Boat Name") +
+  scale_fill_manual(values = boat_colors) +
+  theme_minimal() +  
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+```{r, echo=FALSE}
+print(boat_effort_si)
+print(boat_effort_onboard) 
+```
